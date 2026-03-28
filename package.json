@@ -1,0 +1,33 @@
+{
+  "name": "chess-coach-multiagents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "vitest run",
+    "test:evals": "vitest run src/evals",
+    "seed:theory": "tsx src/lib/rag/theory-seeder.ts"
+  },
+  "dependencies": {
+    "next": "^15.2.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "chess.js": "^1.3.0",
+    "stockfish": "^16.0.0",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "tsx": "^4.0.0",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/postcss": "^4.0.0"
+  }
+}
