@@ -1,16 +1,17 @@
 import { fetchGames } from "../../../lib/layer0/game-fetcher";
-import { replayPGN, aggregateByOpening } from "../../../lib/layer0/opening-aggregator";
-import { analyzePosition } from "../../../lib/layer0/stockfish-analyzer";
-import { getCachedEval, storeCachedEval } from "../../../lib/db/supabase";
-import type { PositionEval, StreamEvent } from "../../../lib/types";
+import { aggregateByOpening } from "../../../lib/layer0/opening-aggregator";
+import { storeGames } from "../../../lib/db/supabase";
+import type { StreamEvent } from "../../../lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 300; // 5 min — Railway has no hard limit
+export const maxDuration = 60;
 
 export async function POST(req: Request): Promise<Response> {
   let username: string;
+  let perfType: string | undefined;
+  let since: number | undefined;
   try {
-    const body = (await req.json()) as { username?: string };
+    const body = (await req.json()) as { username?: string; perfType?: string; since?: number };
     username = (body.username ?? "").trim();
     if (!username) {
       return new Response(JSON.stringify({ error: "username is required" }), {
@@ -18,6 +19,8 @@ export async function POST(req: Request): Promise<Response> {
         headers: { "Content-Type": "application/json" },
       });
     }
+    perfType = body.perfType;
+    since = body.since;
   } catch {
     return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
       status: 400,
@@ -32,22 +35,18 @@ export async function POST(req: Request): Promise<Response> {
       const send = (event: StreamEvent) => {
         try {
           controller.enqueue(encoder.encode(JSON.stringify(event) + "\n"));
-        } catch {
-          // Stream may be closed
-        }
+        } catch {}
       };
 
       try {
+        console.log(`[analyze] Fetching games for ${username} perfType=${perfType} since=${since}`);
         send({ type: "progress", message: "Fetching games from Lichess..." });
 
         let games;
         try {
-          games = await fetchGames(username, 10);
+          games = await fetchGames(username, { perfType, since });
         } catch (err) {
-          send({
-            type: "error",
-            message: err instanceof Error ? err.message : "Failed to fetch games",
-          });
+          send({ type: "error", message: err instanceof Error ? err.message : "Failed to fetch games" });
           controller.close();
           return;
         }
@@ -58,51 +57,22 @@ export async function POST(req: Request): Promise<Response> {
           return;
         }
 
-        send({ type: "progress", message: `Found ${games.length} games. Running Stockfish analysis...` });
-
-        // Map from gameId → PositionEval[]
-        const positionsByGameId = new Map<string, PositionEval[]>();
-
-        for (const game of games) {
-          const playerPositions = replayPGN(game.pgn, game.id, game.playerColor);
-          const evals: PositionEval[] = [];
-
-          send({
-            type: "progress",
-            message: `Analyzing ${game.opening.name} (${playerPositions.length} positions)...`,
-          });
-
-          for (const { fen, move, moveNumber } of playerPositions) {
-            // Check Supabase cache first
-            const cached = await getCachedEval(fen);
-            if (cached) {
-              evals.push({ ...cached, game_id: game.id, move_number: moveNumber });
-              continue;
-            }
-
-            // Run Stockfish
-            const result = await analyzePosition(fen, move, game.id, moveNumber);
-            if (result) {
-              evals.push(result);
-              // Store in cache (non-blocking — error won't stop analysis)
-              storeCachedEval(fen, result).catch(() => {});
-            }
-          }
-
-          positionsByGameId.set(game.id, evals);
+        console.log(`[analyze] Fetched ${games.length} games — storing in Supabase`);
+        for (const g of games.slice(0, 3)) {
+          console.log(`[analyze][debug] Game ${g.id}: pgn length=${g.pgn.length}, eco=${g.opening.eco}, pgn start="${g.pgn.slice(0, 60)}"`);
         }
+        send({ type: "progress", message: `Fetched ${games.length} games — saving to database...` });
+        storeGames(username, games, perfType).catch((err) =>
+          console.error("[analyze][db] Failed to store games:", err)
+        );
 
-        send({ type: "progress", message: "Aggregating opening statistics..." });
-
-        const openings = aggregateByOpening(games, positionsByGameId);
+        const openings = aggregateByOpening(games);
+        console.log(`[analyze] ${openings.length} openings (>1 game) — sending to client`);
 
         send({ type: "openings", openings });
         send({ type: "done" });
       } catch (err) {
-        send({
-          type: "error",
-          message: err instanceof Error ? err.message : "Unexpected error during analysis",
-        });
+        send({ type: "error", message: err instanceof Error ? err.message : "Unexpected error" });
       } finally {
         controller.close();
       }
