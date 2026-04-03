@@ -45,66 +45,104 @@ export function replayPGN(
 }
 
 /**
- * Group PositionEval[] by ECO opening and compute per-opening stats.
- * Returns OpeningStats[] sorted by avg_cp_loss descending (worst first).
+ * Group games by ECO opening and compute per-opening stats (win/loss/draw only).
+ * No Stockfish data — returns immediately after game fetch.
  */
-export function aggregateByOpening(
-  games: RawGame[],
-  positionsByGameId: Map<string, PositionEval[]>
-): OpeningStats[] {
-  // Group games by ECO code
-  const byEco = new Map<string, { game: RawGame; positions: PositionEval[] }[]>();
+export function aggregateByOpening(games: RawGame[]): OpeningStats[] {
+  const byEco = new Map<string, RawGame[]>();
 
   for (const game of games) {
     const eco = game.opening.eco;
-    const positions = positionsByGameId.get(game.id) ?? [];
-
     if (!byEco.has(eco)) byEco.set(eco, []);
-    byEco.get(eco)!.push({ game, positions });
+    byEco.get(eco)!.push(game);
   }
 
   const results: OpeningStats[] = [];
 
   for (const [eco, entries] of byEco) {
-    const allPositions = entries.flatMap((e) => e.positions);
-    const blunders = allPositions.filter((p) => p.cp_loss >= 150);
+    let wins = 0, losses = 0, draws = 0;
 
-    const totalCpLoss = allPositions.reduce((sum, p) => sum + p.cp_loss, 0);
-    const avgCpLoss =
-      allPositions.length > 0 ? totalCpLoss / allPositions.length : 0;
-
-    let wins = 0;
-    let losses = 0;
-    let draws = 0;
-
-    for (const { game } of entries) {
-      if (!game.winner || game.winner === "draw") {
-        draws++;
-      } else if (game.winner === game.playerColor) {
-        wins++;
-      } else {
-        losses++;
-      }
+    for (const game of entries) {
+      if (!game.winner || game.winner === "draw") draws++;
+      else if (game.winner === game.playerColor) wins++;
+      else losses++;
     }
 
-    const performance: "strong" | "average" | "weak" =
-      avgCpLoss < 50 ? "strong" : avgCpLoss > 100 ? "weak" : "average";
+    const gamesPlayed = entries.length;
+    const winRate = gamesPlayed > 0 ? (wins + 0.5 * draws) / gamesPlayed : 0;
 
     results.push({
       eco,
-      name: entries[0]?.game.opening.name ?? eco,
-      games_played: entries.length,
+      name: entries[0]?.opening.name ?? eco,
+      games_played: gamesPlayed,
       wins,
       losses,
       draws,
-      avg_cp_loss: Math.round(avgCpLoss),
-      total_cp_loss: totalCpLoss,
-      positions: allPositions,
-      blunders,
-      performance,
+      win_rate: winRate,
+      avg_cp_loss: 0,
+      total_cp_loss: 0,
+      positions: [],
+      blunders: [],
+      performance: "average", // placeholder — overwritten by categorizeByWinRate
     });
   }
 
-  // Sort worst openings first
-  return results.sort((a, b) => b.avg_cp_loss - a.avg_cp_loss);
+  return categorizeByWinRate(results.filter((o) => o.games_played > 1));
+}
+
+/**
+ * Split openings into thirds by win rate (relative ranking).
+ * Top third → strong, middle → average, bottom → needs_work.
+ */
+export function categorizeByWinRate(openings: OpeningStats[]): OpeningStats[] {
+  if (openings.length === 0) return openings;
+
+  const sorted = [...openings].sort(
+    (a, b) => b.win_rate - a.win_rate || b.games_played - a.games_played
+  );
+
+  const n = sorted.length;
+  const strongEnd = Math.ceil(n / 3);
+  const avgEnd = strongEnd + Math.ceil((n - strongEnd) / 2);
+
+  return sorted.map((o, i) => ({
+    ...o,
+    performance:
+      i < strongEnd ? "strong" : i < avgEnd ? "average" : "needs_work",
+  }));
+}
+
+/**
+ * Enrich already-aggregated openings with Stockfish eval data.
+ * Call this after background analysis completes.
+ */
+export function enrichWithEvals(
+  openings: OpeningStats[],
+  positionsByGameId: Map<string, PositionEval[]>,
+  games: RawGame[]
+): OpeningStats[] {
+  // Build eco → positions map
+  const positionsByEco = new Map<string, PositionEval[]>();
+
+  for (const game of games) {
+    const positions = positionsByGameId.get(game.id) ?? [];
+    const existing = positionsByEco.get(game.opening.eco) ?? [];
+    positionsByEco.set(game.opening.eco, [...existing, ...positions]);
+  }
+
+  return openings.map((o) => {
+    const allPositions = positionsByEco.get(o.eco) ?? [];
+    const blunders = allPositions.filter((p) => p.cp_loss >= 150);
+    const totalCpLoss = allPositions.reduce((sum, p) => sum + p.cp_loss, 0);
+    const avgCpLoss =
+      allPositions.length > 0 ? Math.round(totalCpLoss / allPositions.length) : 0;
+
+    return {
+      ...o,
+      positions: allPositions,
+      blunders,
+      avg_cp_loss: avgCpLoss,
+      total_cp_loss: totalCpLoss,
+    };
+  });
 }
