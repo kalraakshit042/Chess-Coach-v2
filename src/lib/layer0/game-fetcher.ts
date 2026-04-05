@@ -1,13 +1,20 @@
 import type { RawGame } from "../types";
 
 const LICHESS_API_BASE = "https://lichess.org/api";
-const FETCH_TIMEOUT_MS = 15_000;
+const FETCH_TIMEOUT_MS = 30_000;
 
 export async function fetchGames(
   username: string,
-  count = 10
+  options?: { perfType?: string; since?: number }
 ): Promise<RawGame[]> {
-  const url = `${LICHESS_API_BASE}/games/user/${encodeURIComponent(username)}?max=${count}&opening=true&pgnInJson=false`;
+  const params = new URLSearchParams({
+    opening: "true",
+    pgnInJson: "true",
+  });
+  if (options?.perfType) params.set("perfType", options.perfType);
+  if (options?.since) params.set("since", String(options.since));
+
+  const url = `${LICHESS_API_BASE}/games/user/${encodeURIComponent(username)}?${params}`;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);

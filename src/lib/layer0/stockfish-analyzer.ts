@@ -142,15 +142,12 @@ export async function analyzePosition(
   depth = DEFAULT_DEPTH
 ): Promise<PositionEval | null> {
   try {
-    const fenParts = fen.split(" ");
-    const playerIsWhite = (fenParts[1] ?? "w") === "w";
-
     const { entries: beforeEntries, reachedDepth, hasMate } = await runEngineAnalysis(fen, depth);
     if (beforeEntries.length === 0) return null;
 
     const best = beforeEntries[0];
     const cpBeforeRaw = best.mate !== null ? (best.mate > 0 ? 30_000 : -30_000) : best.cp;
-    const cpBefore = playerIsWhite ? cpBeforeRaw : -cpBeforeRaw;
+    const cpBefore = cpBeforeRaw;
 
     let cpAfter = cpBefore;
     const pvPlayed: string[] = [];
@@ -164,7 +161,7 @@ export async function analyzePosition(
         if (afterEntries.length > 0) {
           const bestAfter = afterEntries[0];
           const cpAfterRaw = bestAfter.mate !== null ? (bestAfter.mate > 0 ? 30_000 : -30_000) : bestAfter.cp;
-          cpAfter = playerIsWhite ? -cpAfterRaw : cpAfterRaw;
+          cpAfter = -cpAfterRaw;
           pvPlayed.push(...(bestAfter.pv ?? []).slice(0, 3));
         }
       }

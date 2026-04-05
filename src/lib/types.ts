@@ -33,11 +33,12 @@ export interface OpeningStats {
   wins: number;
   losses: number;
   draws: number;
+  win_rate: number;             // (wins + 0.5*draws) / games_played
   avg_cp_loss: number;
   total_cp_loss: number;
   positions: PositionEval[];    // all positions in games with this opening
   blunders: PositionEval[];     // positions with cp_loss >= 150
-  performance: "strong" | "average" | "weak";
+  performance: "strong" | "average" | "needs_work";
 }
 
 // ─── RAG ─────────────────────────────────────────────────────────────────────

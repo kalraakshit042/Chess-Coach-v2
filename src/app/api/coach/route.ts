@@ -1,7 +1,6 @@
-import { fetchGames } from "../../../lib/layer0/game-fetcher";
 import { replayPGN } from "../../../lib/layer0/opening-aggregator";
 import { analyzePosition } from "../../../lib/layer0/stockfish-analyzer";
-import { getCachedEval, storeCachedEval, getCachedAnalysis, storeCachedAnalysis, getOpeningTheory } from "../../../lib/db/supabase";
+import { getCachedEval, storeCachedEval, getCachedAnalysis, storeCachedAnalysis, getOpeningTheory, getGamesByOpening } from "../../../lib/db/supabase";
 import { buildEvidence } from "../../../lib/layer1/evidence-builder";
 import { classifyMistake } from "../../../lib/layer1/mistake-classifier";
 import { analyzeBestMoveIntent } from "../../../lib/layer1/best-move-intent";
@@ -13,6 +12,7 @@ import { aggregatePatterns } from "../../../lib/layer2/pattern-aggregator";
 import { generateImprovementPlan } from "../../../lib/layer2/improvement-planner";
 import { buildTheoryContext } from "../../../lib/rag/theory-fetcher";
 import type { PositionEval, LessonCard, StreamEvent } from "../../../lib/types";
+
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
@@ -67,62 +67,54 @@ export async function POST(req: Request): Promise<Response> {
       };
 
       try {
-        // Fetch opening theory for RAG
+        console.log(`[coach] Loading theory for ${eco}`);
         const theory = await getOpeningTheory(eco);
         const theoryContext = theory ? buildTheoryContext(theory) : undefined;
+        console.log(`[coach][db] Theory ${theory ? "found" : "not found"} for ${eco}`);
 
-        send({ type: "progress", message: `Loading theory for ${openingName}...` });
+        console.log(`[coach][db] Loading games for ${username} / ${eco} from Supabase`);
+        send({ type: "progress", message: "Loading games from database..." });
 
-        // Fetch games and find all that match this ECO
-        send({ type: "progress", message: "Fetching games from Lichess..." });
-        let games;
-        try {
-          games = await fetchGames(username, 10);
-        } catch (err) {
-          send({ type: "error", message: err instanceof Error ? err.message : "Failed to fetch games" });
-          controller.close();
-          return;
-        }
-
-        const openingGames = games.filter((g) => g.opening.eco === eco);
-
+        const openingGames = await getGamesByOpening(username, eco);
         if (openingGames.length === 0) {
-          send({ type: "error", message: `No games found for opening ${eco}` });
-          controller.close();
+          send({ type: "error", message: `No games found for ${eco} in database — run analysis first` });
           return;
         }
 
-        send({ type: "progress", message: `Found ${openingGames.length} games in ${openingName}. Analyzing positions...` });
+        console.log(`[coach][db] Loaded ${openingGames.length} games for ${eco}`);
+        send({ type: "progress", message: `Running Stockfish on ${openingGames.length} game(s)...` });
 
-        // Collect all blunder positions from this opening's games
         const blunderPositions: Array<{ eval_: PositionEval; gameId: string }> = [];
 
         for (const game of openingGames) {
+          console.log(`[coach][stockfish] Game ${game.id}: pgn length=${game.pgn.length}, color=${game.playerColor}, pgn start="${game.pgn.slice(0, 80)}"`);
           const playerPositions = replayPGN(game.pgn, game.id, game.playerColor);
-
+          console.log(`[coach][stockfish] Game ${game.id}: ${playerPositions.length} positions`);
           for (const { fen, move, moveNumber } of playerPositions) {
-            let result = await getCachedEval(fen);
-            if (!result) {
-              result = await analyzePosition(fen, move, game.id, moveNumber);
-              if (result) storeCachedEval(fen, result).catch(() => {});
-            }
-            if (result && result.cp_loss >= 150) {
-              blunderPositions.push({ eval_: { ...result, game_id: game.id, move_number: moveNumber }, gameId: game.id });
+            const cached = await getCachedEval(fen);
+            if (cached) {
+              console.log(`[coach][db] CACHE HIT  ${fen.slice(0, 40)}`);
+              if (cached.cp_loss >= 150) blunderPositions.push({ eval_: { ...cached, game_id: game.id, move_number: moveNumber }, gameId: game.id });
+            } else {
+              console.log(`[coach][db] CACHE MISS ${fen.slice(0, 40)} — running Stockfish`);
+              const result = await analyzePosition(fen, move, game.id, moveNumber);
+              if (result) {
+                storeCachedEval(fen, result).catch(() => {});
+                if (result.cp_loss >= 150) blunderPositions.push({ eval_: result, gameId: game.id });
+              }
             }
           }
         }
 
         if (blunderPositions.length === 0) {
-          send({ type: "progress", message: "No significant mistakes found in this opening (all moves within 150cp of best)." });
+          send({ type: "progress", message: "No significant mistakes found in this opening." });
           send({ type: "done" });
-          controller.close();
           return;
         }
 
-        // Sort worst first
         blunderPositions.sort((a, b) => b.eval_.cp_loss - a.eval_.cp_loss);
-
-        send({ type: "progress", message: `Found ${blunderPositions.length} significant mistakes. Running coaching pipeline...` });
+        console.log(`[coach] ${blunderPositions.length} blunders (≥150cp) to analyze`);
+        send({ type: "progress", message: `Found ${blunderPositions.length} significant mistake(s). Running AI analysis...` });
 
         const lessonCards: LessonCard[] = [];
 
@@ -130,56 +122,42 @@ export async function POST(req: Request): Promise<Response> {
           const evidence = buildEvidence(eval_, gameId, eco);
           const positionId = evidence.position_id;
 
-          // Check cache first
+          console.log(`[coach][db] Checking cache for ${positionId}`);
           const cached = await getCachedAnalysis(positionId, username);
           if (cached) {
+            console.log(`[coach][db] CACHE HIT  ${positionId}`);
             lessonCards.push(cached);
             send({ type: "position", card: cached });
             continue;
           }
+          console.log(`[coach][db] CACHE MISS ${positionId} — running agents`);
 
-          send({ type: "progress", message: `Analyzing position ${positionId}...` });
+          send({ type: "progress", message: `Analyzing mistake ${lessonCards.length + 1} of ${blunderPositions.length} (-${eval_.cp_loss}cp)...` });
 
           try {
-            // Run 5 micro-agents
+            console.log(`[coach][agent] classifier + intent + failure in parallel for ${positionId}`);
             const [classification, intent, failure] = await Promise.all([
               classifyMistake(evidence, apiKey),
               analyzeBestMoveIntent(evidence, apiKey),
               analyzePlayedMoveFailure(evidence, apiKey),
             ]);
+            console.log(`[coach][agent] classifier → ${classification.mistake_type} (${classification.severity})`);
 
             const mode = classification.primary_category;
 
-            const initialExplanation = await runCoach(
-              evidence,
-              classification,
-              intent,
-              failure,
-              mode,
-              apiKey,
-              theoryContext
-            );
+            console.log(`[coach][agent] coach generating explanation (mode: ${mode})`);
+            const initialExplanation = await runCoach(evidence, classification, intent, failure, mode, apiKey, theoryContext);
 
+            console.log(`[coach][agent] critic verifying explanation`);
             const { explanation, confidence, critique: critiqueResult } = await critique(
-              evidence,
-              initialExplanation,
-              classification,
-              intent,
-              failure,
-              mode,
-              apiKey,
-              theoryContext
+              evidence, initialExplanation, classification, intent, failure, mode, apiKey, theoryContext
             );
+            console.log(`[coach][agent] critic → ${critiqueResult.overall_verdict}, confidence: ${confidence}`);
 
             const card = buildLessonCard(evidence, classification, explanation, critiqueResult, confidence);
 
-            // Cache and stream
-            storeCachedAnalysis(positionId, username, card, {
-              classification,
-              intent,
-              failure,
-              critique: critiqueResult,
-            }).catch(() => {});
+            console.log(`[coach][db] Storing lesson card for ${positionId}`);
+            storeCachedAnalysis(positionId, username, card, { classification, intent, failure, critique: critiqueResult }).catch(() => {});
 
             lessonCards.push(card);
             send({ type: "position", card });
@@ -194,6 +172,7 @@ export async function POST(req: Request): Promise<Response> {
         }
 
         if (lessonCards.length > 0) {
+          console.log(`[coach][agent] planner generating improvement plan for ${lessonCards.length} cards`);
           send({ type: "progress", message: "Generating improvement plan..." });
           const patterns = aggregatePatterns(lessonCards);
           const plan = await generateImprovementPlan(lessonCards, patterns, openingName, apiKey);

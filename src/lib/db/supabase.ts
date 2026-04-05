@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import type {
+  RawGame,
   PositionEval,
   LessonCard,
   OpeningTheory,
@@ -13,9 +14,8 @@ import type {
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 function getClient() {
-  const url = process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key =
-    process.env.SUPABASE_ANON_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_ANON_KEY;
 
   if (!url || !key) {
     throw new Error(
@@ -28,13 +28,17 @@ function getClient() {
 
 // ─── Position Evals (Stockfish cache) ────────────────────────────────────────
 
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
 export async function getCachedEval(fen: string): Promise<PositionEval | null> {
   try {
     const supabase = getClient();
+    const cutoff = new Date(Date.now() - THIRTY_DAYS_MS).toISOString();
     const { data, error } = await supabase
       .from("position_evals")
       .select("*")
       .eq("fen", fen)
+      .gt("created_at", cutoff)
       .single();
 
     if (error || !data) return null;
@@ -208,6 +212,56 @@ export async function storeCachedImprovementPlan(
   }
 }
 
+// ─── User Games ──────────────────────────────────────────────────────────────
+
+export async function storeGames(
+  username: string,
+  games: RawGame[],
+  perfType?: string
+): Promise<void> {
+  try {
+    const supabase = getClient();
+    const rows = games.map((g) => ({
+      username: username.toLowerCase(),
+      game_id: g.id,
+      pgn: g.pgn,
+      opening_eco: g.opening.eco,
+      opening_name: g.opening.name,
+      winner: g.winner ?? null,
+      player_color: g.playerColor,
+      perf_type: perfType ?? null,
+    }));
+    await supabase.from("user_games").upsert(rows, { onConflict: "game_id" });
+  } catch {
+    // Non-fatal — games can be re-fetched
+  }
+}
+
+export async function getGamesByOpening(
+  username: string,
+  eco: string
+): Promise<RawGame[]> {
+  const supabase = getClient();
+  const { data, error } = await supabase
+    .from("user_games")
+    .select("*")
+    .eq("username", username.toLowerCase())
+    .eq("opening_eco", eco);
+
+  if (error || !data) return [];
+
+  return data.map((row: Record<string, unknown>) => ({
+    id: row.game_id as string,
+    pgn: row.pgn as string,
+    opening: {
+      eco: row.opening_eco as string,
+      name: row.opening_name as string,
+    },
+    winner: (row.winner as "white" | "black" | "draw" | undefined) ?? undefined,
+    playerColor: row.player_color as "white" | "black",
+  }));
+}
+
 // ─── Database Schema SQL (for reference / migration) ─────────────────────────
 export const SCHEMA_SQL = `
 -- Run this in the Supabase SQL editor
@@ -266,5 +320,18 @@ CREATE TABLE IF NOT EXISTS improvement_plans (
   lesson_cards JSONB NOT NULL,
   created_at   TIMESTAMPTZ DEFAULT now(),
   UNIQUE (username, eco)
+);
+
+CREATE TABLE IF NOT EXISTS user_games (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  username      TEXT NOT NULL,
+  game_id       TEXT NOT NULL UNIQUE,
+  pgn           TEXT NOT NULL,
+  opening_eco   TEXT NOT NULL,
+  opening_name  TEXT NOT NULL,
+  winner        TEXT,
+  player_color  TEXT NOT NULL,
+  perf_type     TEXT,
+  fetched_at    TIMESTAMPTZ DEFAULT now()
 );
 `;
