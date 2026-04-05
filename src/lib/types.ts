@@ -43,6 +43,19 @@ export interface OpeningStats {
 
 // ─── RAG ─────────────────────────────────────────────────────────────────────
 
+export interface CriticalJunction {
+  move_number: number;
+  fen: string;
+  description: string;
+  correct_responses: string[];      // SAN moves that stay in theory
+  common_mistakes: string[];        // SAN moves club players often play wrong
+  mistake_explanation: string;      // 1 sentence: why the wrong move fails
+  lichess_stats?: {
+    top_moves: Array<{ move: string; games: number; white_wins: number; draws: number; black_wins: number }>;
+    total_games: number;
+  };
+}
+
 export interface OpeningTheory {
   eco: string;
   eco_family: string;
@@ -53,6 +66,33 @@ export interface OpeningTheory {
   key_thematic_moves: string[];
   positional_themes: string[];
   theory_summary: string;
+  // v2 fields — optional for backward compat with rows seeded before migration
+  critical_junctions?: CriticalJunction[];
+  transition_move?: number;         // move number where opening ends
+  resulting_structure?: string;     // e.g. "isolated d-pawn in open position"
+  structure_demands?: string[];     // 2-4 bullets: what this structure requires
+  theory_move_sequence?: string[];  // main-line moves in SAN order
+  seeded_at?: string;               // ISO timestamp
+}
+
+export type OpeningDiffResult =
+  | { status: "followed_theory"; last_theory_move: number }
+  | { status: "deviated_at_junction"; junction: CriticalJunction; played_move: string; move_number: number }
+  | { status: "correct_moves_wrong_plan"; transition_move: number; resulting_structure: string }
+  | { status: "no_theory_available" };
+
+export interface OpeningDiagnosis {
+  eco: string;
+  opening_name: string;
+  diff_result: OpeningDiffResult;
+  diagnosis: string;                // 1-sentence: what the player misunderstands
+  evidence_positions: Array<{
+    fen: string;
+    move_number: number;
+    player_move: string;
+    correct_move: string;
+    explanation: string;
+  }>;
 }
 
 // ─── Layer 1: Evidence & agent outputs ───────────────────────────────────────
@@ -167,6 +207,7 @@ export type StreamEvent =
   | { type: "progress"; message: string }
   | { type: "openings"; openings: OpeningStats[] }
   | { type: "position"; card: LessonCard }
+  | { type: "opening_diagnosis"; diagnosis: OpeningDiagnosis }
   | { type: "plan"; plan: ImprovementPlan }
   | { type: "done" }
   | { type: "error"; message: string };

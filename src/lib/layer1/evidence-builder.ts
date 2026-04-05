@@ -1,5 +1,18 @@
 import type { PositionEval, EvidencePacket } from "../types";
 
+const MATERIAL_SCORES: Record<string, number> = { q: 9, Q: 9, r: 5, R: 5, b: 3, B: 3, n: 3, N: 3 };
+
+function classifyPhase(fen: string, moveNumber: number): "opening" | "middlegame" | "endgame" {
+  const placement = fen.split(" ")[0];
+  let totalMaterial = 0;
+  for (const ch of placement) {
+    if (ch in MATERIAL_SCORES) totalMaterial += MATERIAL_SCORES[ch];
+  }
+  if (totalMaterial <= 24) return "endgame";
+  if (moveNumber <= 15 && totalMaterial >= 44) return "opening";
+  return "middlegame";
+}
+
 /**
  * Convert a raw PositionEval from Stockfish into an EvidencePacket.
  * All Claude agents receive EvidencePackets — never raw UCI output.
@@ -12,15 +25,7 @@ export function buildEvidence(
   const moveNumber = eval_.move_number;
   const positionId = `${gameId}_move${moveNumber}`;
 
-  // Classify game phase by move number
-  let phase: "opening" | "middlegame" | "endgame";
-  if (moveNumber <= 12) {
-    phase = "opening";
-  } else if (moveNumber <= 30) {
-    phase = "middlegame";
-  } else {
-    phase = "endgame";
-  }
+  const phase = classifyPhase(eval_.fen, moveNumber);
 
   return {
     position_id: positionId,

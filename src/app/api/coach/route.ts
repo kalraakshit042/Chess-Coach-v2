@@ -11,7 +11,10 @@ import { buildLessonCard } from "../../../lib/layer2/lesson-card-builder";
 import { aggregatePatterns } from "../../../lib/layer2/pattern-aggregator";
 import { generateImprovementPlan } from "../../../lib/layer2/improvement-planner";
 import { buildTheoryContext } from "../../../lib/rag/theory-fetcher";
-import type { PositionEval, LessonCard, StreamEvent } from "../../../lib/types";
+import { diffAllGames } from "../../../lib/rag/opening-diff";
+import { seedOpeningV2 } from "../../../lib/rag/theory-seeder";
+import { buildOpeningDiagnosis } from "../../../lib/layer2/opening-diagnosis-builder";
+import type { PositionEval, LessonCard, StreamEvent, OpeningTheory } from "../../../lib/types";
 
 
 export const runtime = "nodejs";
@@ -68,9 +71,23 @@ export async function POST(req: Request): Promise<Response> {
 
       try {
         console.log(`[coach] Loading theory for ${eco}`);
-        const theory = await getOpeningTheory(eco);
+        let theory: OpeningTheory | null = await getOpeningTheory(eco);
+
+        // On-demand v2 seeding: trigger if theory exists but has no critical_junctions
+        if (theory && !theory.critical_junctions) {
+          send({ type: "progress", message: "Enriching opening theory with Lichess data (first time for this opening)..." });
+          try {
+            await seedOpeningV2(eco, openingName);
+            theory = await getOpeningTheory(eco);
+            console.log(`[coach][seeder] v2 seeding complete for ${eco}`);
+          } catch (err) {
+            console.warn(`[coach][seeder] v2 seeding failed for ${eco}:`, err);
+            // Non-fatal — continue with v1 theory
+          }
+        }
+
         const theoryContext = theory ? buildTheoryContext(theory) : undefined;
-        console.log(`[coach][db] Theory ${theory ? "found" : "not found"} for ${eco}`);
+        console.log(`[coach][db] Theory ${theory ? (theory.critical_junctions ? "v2" : "v1") : "not found"} for ${eco}`);
 
         console.log(`[coach][db] Loading games for ${username} / ${eco} from Supabase`);
         send({ type: "progress", message: "Loading games from database..." });
@@ -82,6 +99,14 @@ export async function POST(req: Request): Promise<Response> {
         }
 
         console.log(`[coach][db] Loaded ${openingGames.length} games for ${eco}`);
+
+        // Opening diff — pure move comparison, no Stockfish needed
+        const diffResults = theory ? diffAllGames(openingGames, theory) : new Map<string, import("../../../lib/types").OpeningDiffResult>();
+        const junctionDeviations = [...diffResults.values()].filter((r) => r.status === "deviated_at_junction").length;
+        if (diffResults.size > 0) {
+          send({ type: "progress", message: `Opening diff: ${junctionDeviations} junction deviation(s) across ${diffResults.size} game(s)` });
+        }
+
         send({ type: "progress", message: `Running Stockfish on ${openingGames.length} game(s)...` });
 
         const blunderPositions: Array<{ eval_: PositionEval; gameId: string }> = [];
@@ -168,6 +193,19 @@ export async function POST(req: Request): Promise<Response> {
               type: "progress",
               message: `Skipped position ${positionId} (analysis error)`,
             });
+          }
+        }
+
+        // Opening diagnosis — structural analysis anchored to theory
+        if (theory?.critical_junctions && diffResults.size > 0) {
+          try {
+            send({ type: "progress", message: "Building opening diagnosis..." });
+            const openingPhaseCards = lessonCards.filter((c) => c.category === "opening");
+            const diagnosis = await buildOpeningDiagnosis(eco, openingName, theory, diffResults, openingPhaseCards, apiKey);
+            send({ type: "opening_diagnosis", diagnosis });
+            console.log(`[coach][agent] opening diagnosis: "${diagnosis.diagnosis}"`);
+          } catch (err) {
+            console.warn(`[coach][agent] opening diagnosis failed:`, err);
           }
         }
 
